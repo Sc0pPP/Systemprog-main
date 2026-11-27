@@ -21,6 +21,7 @@ void run(const char* file, const char* name)
         hello();
         FreeLibrary(lib);
     }
+
     catch (const char* error)
     {
         printf("Ошибка: %s\n", error);
