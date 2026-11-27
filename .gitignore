@@ -1,0 +1,18 @@
+# --- Не-Windows (macOS / Xcode) — не входит в сборку для Windows ---
+*.xcodeproj/
+*.xcworkspace/
+DllLab/DllLab/
+ScreenBuffer/main.c
+VirtualMemory/child/main.c
+VirtualMemory/parent/main.c
+VirtualMemory/VirtualMemory.xcworkspace/
+
+# --- Промежуточные и конечные результаты сборки, настройки IDE ---
+.vs/
+**/bin/
+**/obj/
+**/x64/
+**/Debug/
+**/Release/
+**/ipch/
+*.user
