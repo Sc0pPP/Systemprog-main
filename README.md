@@ -48,3 +48,5 @@ Windows-сборки; macOS-версии (Xcode) исключены через .
 Корневые `main_windows.c` в `ScreenBuffer/`, `VirtualMemory/child/` и
 `VirtualMemory/parent/` — точные дубли версий из папок `*Win/`.
 Правки вносите в версии из `*Win/`, затем синхронизируйте копии.
+
+> Совместимость: проекты используют набор инструментов **v143** (Visual Studio 2022).
