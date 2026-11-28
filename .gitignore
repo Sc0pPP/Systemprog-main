@@ -16,3 +16,4 @@ VirtualMemory/VirtualMemory.xcworkspace/
 **/Release/
 **/ipch/
 *.user
+*.vcxproj.user
