@@ -29,7 +29,11 @@
  *      (WriteProcessMemory) и сигнализирует "сообщение готово";
  *   5. дочерний процесс читает сообщение, пишет ответ по адресу из
  *      командной строки и сигнализирует "ответ готов";
- *   6. родитель читает ответ (ReadProcessMemory).
+ *   6. родитель читает ответ (ReadProcessMemory) и сигнализирует
+ *      "ответ прочитан";
+ *   7. дочерний процесс ждет "ответ прочитан" и только после этого
+ *      освобождает память и завершается (иначе выход уничтожает его
+ *      адресное пространство до того, как родитель успеет прочитать).
  *
  * Сборка: пустой проект Visual Studio, добавить файл; родителю нужен
  * child.exe рядом с собственным исполняемым файлом (каталог Debug).
@@ -39,11 +43,34 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 
 #define SHM_NAME "Local\\sp_vm_exchange"
 #define EV_CHILD_READY  "Local\\sp_vm_child_ready"
 #define EV_MESSAGE_READY "Local\\sp_vm_message_ready"
 #define EV_REPLY_READY  "Local\\sp_vm_reply_ready"
+/* мьютекс очереди вывода: без него строки обоих процессов перемешиваются */
+#define MTX_CONSOLE     "Local\\sp_vm_console_lock"
+/* подтверждение, что родитель забрал ответ (иначе child выходит раньше) */
+#define EV_REPLY_READ   "Local\\sp_vm_reply_read"
+
+/* Печать в общую консоль только владельцем мьютекса, иначе printf
+ * родителя и child идут в одно окно параллельно и текст слипается. */
+static HANDLE console_lock = NULL;
+
+static void outf(const char *fmt, ...)
+{
+    va_list args;
+    if (console_lock != NULL) {
+        WaitForSingleObject(console_lock, INFINITE);
+    }
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    if (console_lock != NULL) {
+        ReleaseMutex(console_lock);
+    }
+}
 
 /* кандидаты на общий виртуальный адрес (все 64 КБ-выровнены) */
 static const unsigned long long kHints[] = {
@@ -68,6 +95,7 @@ int main(int argc, char *argv[])
     HANDLE child_ready;
     HANDLE message_ready;
     HANDLE reply_ready;
+    HANDLE reply_read;
     HANDLE wait_objects[2];
     DWORD wait_result;
     SIZE_T written;
@@ -79,8 +107,9 @@ int main(int argc, char *argv[])
 
     SetConsoleOutputCP(CP_UTF8);
     setbuf(stdout, NULL);
-    printf("=== Родительский процесс (pid %lu) ===\n",
-           (unsigned long)GetCurrentProcessId());
+    console_lock = CreateMutexA(NULL, FALSE, MTX_CONSOLE);
+    outf("=== Родительский процесс (pid %lu) ===\n",
+         (unsigned long)GetCurrentProcessId());
 
     GetSystemInfo(&sys_info);
     page_size = sys_info.dwPageSize;
@@ -124,16 +153,17 @@ int main(int argc, char *argv[])
     request = view;              /* сюда родитель пишет сообщение */
     reply = view + stride;       /* отсюда родитель ждет ответ */
 
-    printf("[parent] разделяемая память отображена: запрос @ %p\n",
-           (void *)request);
-    printf("[parent]                               ответ @ %p  <- этот "
-           "адрес получит child\n", (void *)reply);
+    outf("[parent] разделяемая память отображена: запрос @ %p\n"
+         "[parent]                               ответ @ %p  <- этот "
+         "адрес получит child\n", (void *)request, (void *)reply);
 
     /* 3. события синхронизации (CreateEvent) */
     child_ready = CreateEventA(NULL, FALSE, FALSE, EV_CHILD_READY);
     message_ready = CreateEventA(NULL, FALSE, FALSE, EV_MESSAGE_READY);
     reply_ready = CreateEventA(NULL, FALSE, FALSE, EV_REPLY_READY);
-    if (child_ready == NULL || message_ready == NULL || reply_ready == NULL) {
+    reply_read = CreateEventA(NULL, FALSE, FALSE, EV_REPLY_READ);
+    if (child_ready == NULL || message_ready == NULL || reply_ready == NULL ||
+        reply_read == NULL) {
         fprintf(stderr, "[parent] CreateEvent: %lu\n",
                 (unsigned long)GetLastError());
         return 1;
@@ -175,8 +205,8 @@ int main(int argc, char *argv[])
                 (unsigned long)GetLastError());
         return 1;
     }
-    printf("[parent] создан дочерний процесс (pid %lu), передан адрес %p\n",
-           (unsigned long)process_info.dwProcessId, (void *)reply);
+    outf("[parent] создан дочерний процесс (pid %lu), передан адрес %p\n",
+         (unsigned long)process_info.dwProcessId, (void *)reply);
 
     /* 6. ждем, пока дочерний процесс отобразит память (или завершится) */
     wait_objects[0] = child_ready;
@@ -199,14 +229,13 @@ int main(int argc, char *argv[])
                 (unsigned long)GetLastError());
         return 1;
     }
-    printf("[parent] записано в память другого процесса: \"%s\"\n",
-           request);
-    printf("[parent] SetEvent (msg_ready)\n");
+    outf("[parent] записано в память другого процесса: \"%s\"\n"
+         "[parent] SetEvent (msg_ready)\n", request);
     SetEvent(message_ready);
 
     /* 8. ждем события ответа (WaitForMultipleObjects) и читаем память
      *    (ReadProcessMemory) */
-    printf("[parent] WaitForSingleObject (reply_ready)...\n");
+    outf("[parent] WaitForSingleObject (reply_ready)...\n");
     wait_objects[0] = reply_ready;
     wait_result = WaitForMultipleObjects(2, wait_objects, FALSE, INFINITE);
     if (wait_result != WAIT_OBJECT_0) {
@@ -216,26 +245,34 @@ int main(int argc, char *argv[])
     memset(buffer, 0, sizeof(buffer));
     if (!ReadProcessMemory(process_info.hProcess, reply, buffer,
                            page_size, &read_bytes)) {
+        /* отпускаем child, иначе он повиснет в ожидании "ответ прочитан" */
+        SetEvent(reply_read);
         fprintf(stderr, "[parent] ReadProcessMemory: %lu\n",
                 (unsigned long)GetLastError());
         return 1;
     }
-    printf("[parent] прочитано из памяти другого процесса: \"%s\"\n",
-           buffer);
+    outf("[parent] прочитано из памяти другого процесса: \"%s\"\n",
+         buffer);
+    /* разрешаем child завершаться: ответ уже прочитан */
+    SetEvent(reply_read);
 
     /* 9. завершение дочернего процесса и освобождение ресурсов */
     WaitForSingleObject(process_info.hProcess, INFINITE);
     GetExitCodeProcess(process_info.hProcess, &exit_code);
-    printf("[parent] дочерний процесс завершился (код %lu)\n",
-           (unsigned long)exit_code);
+    outf("[parent] дочерний процесс завершился (код %lu)\n",
+         (unsigned long)exit_code);
 
     UnmapViewOfFile(view);
     CloseHandle(mapping);
     CloseHandle(child_ready);
     CloseHandle(message_ready);
     CloseHandle(reply_ready);
+    CloseHandle(reply_read);
     CloseHandle(process_info.hThread);
     CloseHandle(process_info.hProcess);
-    printf("[parent] готово\n");
+    outf("[parent] готово\n");
+    if (console_lock != NULL) {
+        CloseHandle(console_lock);
+    }
     return 0;
 }

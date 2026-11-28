@@ -15,7 +15,10 @@
  *   3. сигнализировать "дочерний процесс запущен";
  *   4. ждать "сообщение готово", прочитать сообщение;
  *   5. записать ответ по адресу из командной строки и сигнализировать
- *      "ответ готов".
+ *      "ответ готов";
+ *   6. ждать подтверждения "ответ прочитан" — только после него
+ *      освобождать память и завершаться: иначе выход уничтожает адресное
+ *      пространство раньше, чем родитель выполнит ReadProcessMemory.
  */
 
 #include <windows.h>
@@ -23,11 +26,34 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 
 #define SHM_NAME "Local\\sp_vm_exchange"
 #define EV_CHILD_READY  "Local\\sp_vm_child_ready"
 #define EV_MESSAGE_READY "Local\\sp_vm_message_ready"
 #define EV_REPLY_READY  "Local\\sp_vm_reply_ready"
+/* мьютекс очереди вывода, общий с родительским процессом */
+#define MTX_CONSOLE     "Local\\sp_vm_console_lock"
+/* подтверждение от родителя, что ответ прочитан (см. протокол) */
+#define EV_REPLY_READ   "Local\\sp_vm_reply_read"
+
+/* Печать в общую консоль только владельцем мьютекса, иначе printf
+ * родителя и child идут в одно окно параллельно и текст слипается. */
+static HANDLE console_lock = NULL;
+
+static void outf(const char *fmt, ...)
+{
+    va_list args;
+    if (console_lock != NULL) {
+        WaitForSingleObject(console_lock, INFINITE);
+    }
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    if (console_lock != NULL) {
+        ReleaseMutex(console_lock);
+    }
+}
 
 int main(int argc, char *argv[])
 {
@@ -43,11 +69,15 @@ int main(int argc, char *argv[])
     HANDLE child_ready;
     HANDLE message_ready;
     HANDLE reply_ready;
+    HANDLE reply_read;
 
     SetConsoleOutputCP(CP_UTF8);
     setbuf(stdout, NULL);
-    printf("=== Дочерний процесс (pid %lu) ===\n",
-           (unsigned long)GetCurrentProcessId());
+    /* родитель создает этот мьютекс до CreateProcess, открываем первым делом */
+    console_lock = OpenMutexA(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE,
+                              MTX_CONSOLE);
+    outf("=== Дочерний процесс (pid %lu) ===\n",
+         (unsigned long)GetCurrentProcessId());
 
     /* 1. адрес страницы ответа получен через командную строку */
     if (argc < 2) {
@@ -65,8 +95,8 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[child] некорректный адрес: %s\n", argv[1]);
         return 1;
     }
-    printf("[child] адрес из командной строки: 0x%llx\n",
-           (unsigned long long)reply_addr);
+    outf("[child] адрес из командной строки: 0x%llx\n",
+         (unsigned long long)reply_addr);
 
     GetSystemInfo(&sys_info);
     page_size = sys_info.dwPageSize;
@@ -97,15 +127,16 @@ int main(int argc, char *argv[])
     request = view;              /* сообщение родителя */
     reply = view + stride;       /* сюда пишем ответ */
 
-    printf("[child] страница запроса отображена @ %p\n", (void *)request);
-    printf("[child] страница ответа   отображена @ %p "
-           "(совпадает с адресом родителя)\n", (void *)reply);
+    outf("[child] страница запроса отображена @ %p\n"
+         "[child] страница ответа   отображена @ %p "
+         "(совпадает с адресом родителя)\n", (void *)request, (void *)reply);
 
     /* 3. события синхронизации */
     child_ready = OpenEventA(EVENT_MODIFY_STATE, FALSE, EV_CHILD_READY);
     message_ready = OpenEventA(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE,
                                EV_MESSAGE_READY);
     reply_ready = OpenEventA(EVENT_MODIFY_STATE, FALSE, EV_REPLY_READY);
+    reply_read = OpenEventA(SYNCHRONIZE, FALSE, EV_REPLY_READ);
     if (child_ready == NULL || message_ready == NULL ||
         reply_ready == NULL) {
         fprintf(stderr, "[child] OpenEvent: %lu\n",
@@ -117,22 +148,35 @@ int main(int argc, char *argv[])
     SetEvent(child_ready);
 
     /* 5. ждем сообщение и читаем память */
-    printf("[child] WaitForSingleObject (msg_ready)...\n");
+    outf("[child] WaitForSingleObject (msg_ready)...\n");
     WaitForSingleObject(message_ready, INFINITE);
-    printf("[child] прочитано из памяти другого процесса: \"%s\"\n",
-           request);
+    outf("[child] прочитано из памяти другого процесса: \"%s\"\n",
+         request);
 
     /* 6. ответ записываем по адресу из командной строки */
     snprintf(reply, page_size, "Ответ из дочернего процесса %lu!",
              (unsigned long)GetCurrentProcessId());
-    printf("[child] записан ответ: \"%s\"\n", reply);
-    printf("[child] SetEvent (reply_ready)\n");
+    outf("[child] записан ответ: \"%s\"\n"
+         "[child] SetEvent (reply_ready)\n", reply);
     SetEvent(reply_ready);
+
+    /* 6. ждем подтверждение, что родитель прочитал ответ, и только потом
+     *    освобождаем память: если завершиться раньше, ReadProcessMemory
+     *    родителя получит ERROR_PARTIAL_COPY (код 299) */
+    if (reply_read != NULL) {
+        WaitForSingleObject(reply_read, INFINITE);
+    }
 
     /* 7. освобождение ресурсов */
     UnmapViewOfFile(view);
     CloseHandle(child_ready);
     CloseHandle(message_ready);
     CloseHandle(reply_ready);
+    if (reply_read != NULL) {
+        CloseHandle(reply_read);
+    }
+    if (console_lock != NULL) {
+        CloseHandle(console_lock);
+    }
     return 0;
 }
